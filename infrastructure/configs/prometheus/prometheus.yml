@@ -1,0 +1,54 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: biomedical-local
+
+scrape_configs:
+
+  # Prometheus self-monitoring
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # MinIO — S3-compatible object storage
+  # Exposes cluster metrics at /minio/v2/metrics/cluster (no auth in dev mode)
+  - job_name: minio
+    metrics_path: /minio/v2/metrics/cluster
+    static_configs:
+      - targets: ['minio:9000']
+        labels:
+          service: minio
+
+  # Qdrant — vector database
+  - job_name: qdrant
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['qdrant:6333']
+        labels:
+          service: qdrant
+
+  # Grafana self-monitoring
+  - job_name: grafana
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['grafana:3000']
+        labels:
+          service: grafana
+
+  # Nessie — Iceberg REST catalog (Quarkus metrics)
+  - job_name: nessie
+    metrics_path: /q/metrics
+    static_configs:
+      - targets: ['nessie:19120']
+        labels:
+          service: nessie
+
+  # Agent API — query SLO metrics
+  - job_name: agent_api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['agent-api:8003']
+        labels:
+          service: agent-api
+

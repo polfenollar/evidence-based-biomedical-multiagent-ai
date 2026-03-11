@@ -1,0 +1,18 @@
+# Temporal dynamic configuration — development environment
+# Applied at runtime without server restart (hot-reload).
+# Reference: https://docs.temporal.io/references/dynamic-configuration
+
+# Allow longer workflow execution for multi-agent research runs (up to 24 h)
+system.workflowExecutionMaximumTimeout:
+  - value: 86400s
+    constraints: {}
+
+# Allow larger workflow history for complex agent graphs
+limit.historyCount.suggestContinueAsNew:
+  - value: 5000
+    constraints: {}
+
+# Frontend service — disable version check enforcement for local dev
+frontend.enableClientVersionCheck:
+  - value: false
+    constraints: {}

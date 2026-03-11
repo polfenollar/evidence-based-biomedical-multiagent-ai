@@ -1,0 +1,563 @@
+# Evidence-Based Bio-Medical Multi-Agent System
+# Phase 0 – Infrastructure Baseline
+#
+# Services:
+#   Storage:        minio, minio-init
+#   Database:       postgres, redis, clickhouse
+#   Iceberg catalog: nessie
+#   Orchestration:  temporal, temporal-ui
+#   Vector DB:      qdrant
+#   Tracing:        langfuse
+#   Observability:  prometheus, grafana
+#
+# Usage:
+#   cp .env.example .env   # edit secrets
+#   docker compose up -d
+#   bash scripts/smoke-test.sh
+
+services:
+
+  # ─── Object Storage (MinIO) ──────────────────────────────────────────────────
+
+  minio:
+    image: minio/minio:RELEASE.2024-11-07T00-52-20Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-11-17T19-35-25Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./scripts/init-minio.sh:/init-minio.sh:ro
+    entrypoint: ["/bin/sh", "/init-minio.sh"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    networks:
+      - biomedical
+    restart: "no"
+
+  # ─── Relational Database (shared PostgreSQL) ─────────────────────────────────
+  # Hosts databases for: Temporal, Nessie, Langfuse, Feast registry
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./configs/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Cache / Feast Online Store (Redis) ──────────────────────────────────────
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Iceberg REST Catalog (Project Nessie) ───────────────────────────────────
+  # Version store: PostgreSQL (nessie database)
+  # Warehouse storage: MinIO (iceberg-warehouse bucket)
+
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.99.0
+    container_name: nessie
+    ports:
+      - "19120:19120"   # REST API + UI
+    environment:
+      # Version store backend
+      NESSIE_VERSION_STORE_TYPE: JDBC
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/nessie
+      QUARKUS_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      QUARKUS_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      # Catalog service (REST catalog backed by MinIO)
+      NESSIE_CATALOG_DEFAULT_WAREHOUSE: warehouse
+      NESSIE_CATALOG_WAREHOUSES_WAREHOUSE_LOCATION: "s3://iceberg-warehouse/"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ENDPOINT: "http://minio:9000"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_PATH_STYLE_ACCESS: "true"
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_REGION: us-east-1
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      NESSIE_CATALOG_SERVICE_S3_DEFAULT_OPTIONS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://127.0.0.1:19120/api/v2/config > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Workflow Orchestration (Temporal) ───────────────────────────────────────
+  # auto-setup image handles PostgreSQL schema creation on first start
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    container_name: temporal
+    ports:
+      - "7233:7233"   # gRPC frontend
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD}
+      TEMPORAL_ADDRESS: temporal:7233
+      DYNAMIC_CONFIG_FILE_PATH: /etc/temporal/config/dynamicconfig/development.yaml
+      SKIP_DEFAULT_NAMESPACE_CREATION: "false"
+      DEFAULT_NAMESPACE: default
+      ENABLE_ES: "false"
+    volumes:
+      - ./configs/temporal/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "temporal operator cluster health 2>&1 | grep -q SERVING"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  temporal-ui:
+    image: temporalio/ui:2.47.2
+    container_name: temporal-ui
+    ports:
+      - "8080:8080"   # Web UI
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: "http://localhost:8080"
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Vector Database (Qdrant) ────────────────────────────────────────────────
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.1
+    container_name: qdrant
+    ports:
+      - "6333:6333"   # HTTP / REST API
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/6333' 2>/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Langfuse – Agent Tracing ────────────────────────────────────────────────
+  # Langfuse v3: requires PostgreSQL, ClickHouse, Redis, MinIO
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: clickhouse
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  langfuse:
+    # Using Langfuse v2 (PostgreSQL only) for Phase 0 stability.
+    # Langfuse v3 (+ ClickHouse) is targeted for Phase 6 production hardening.
+    image: langfuse/langfuse:2
+    container_name: langfuse-server
+    ports:
+      - "3000:3000"   # Web UI + API
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/langfuse"
+      NEXTAUTH_URL: "http://localhost:3000"
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      TELEMETRY_ENABLED: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://$(hostname -i):3000/api/public/health > /dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 45s
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Observability (Prometheus + Grafana) ────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  grafana:
+    image: grafana/grafana:11.3.2
+    container_name: grafana
+    ports:
+      - "3001:3000"   # Offset from Langfuse (3000)
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 1: Ingestion Worker ───────────────────────────────────────────────
+  ingestion-worker:
+    build:
+      context: ..
+      dockerfile: src/ingestion_worker/Dockerfile
+    container_name: ingestion-worker
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      NESSIE_URI: http://nessie:19120/api/v2
+      PIPELINE_VERSION: "0.1.0"
+    depends_on:
+      temporal:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 1: Agent API Stub (smoke test) ────────────────────────────────────
+  agent-api-stub:
+    build:
+      context: ..
+      dockerfile: src/agent_api_stub/Dockerfile
+    container_name: agent-api-stub
+    ports:
+      - "8000:8000"
+    environment:
+      NESSIE_URI: http://nessie:19120
+    depends_on:
+      nessie:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 2: Embedding Worker ───────────────────────────────────────────────
+  embedding-worker:
+    build:
+      context: ..
+      dockerfile: src/embedding_worker/Dockerfile
+    container_name: embedding-worker
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      NESSIE_URI: http://nessie:19120/api/v2
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      PIPELINE_VERSION: "0.2.0"
+    depends_on:
+      temporal:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 2: Retrieval API ───────────────────────────────────────────────────
+  retrieval-api:
+    build:
+      context: ..
+      dockerfile: src/retrieval_api/Dockerfile
+    container_name: retrieval-api
+    ports:
+      - "8001:8001"
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 3: Feature Worker ──────────────────────────────────────────────────
+  feature-worker:
+    build:
+      context: ..
+      dockerfile: src/feature_worker/Dockerfile
+    container_name: feature-worker
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      NESSIE_URI: http://nessie:19120/api/v2
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      PIPELINE_VERSION: "0.2.0"
+    depends_on:
+      temporal:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 3: Feature API ─────────────────────────────────────────────────────
+  feature-api:
+    build:
+      context: ..
+      dockerfile: src/feature_api/Dockerfile
+    container_name: feature-api
+    ports:
+      - "8002:8002"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 4: Agent Worker ────────────────────────────────────────────────────
+  agent-worker:
+    build:
+      context: ..
+      dockerfile: src/agent_worker/Dockerfile
+    container_name: agent-worker
+    environment:
+      RETRIEVAL_API_URL: http://retrieval-api:8001
+      FEATURE_API_URL: http://feature-api:8002
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      PIPELINE_VERSION: "0.4.0"
+    depends_on:
+      temporal:
+        condition: service_healthy
+      retrieval-api:
+        condition: service_started
+      feature-api:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 4/5: Agent API ─────────────────────────────────────────────────────
+  agent-api:
+    build:
+      context: ..
+      dockerfile: src/agent_api/Dockerfile
+    container_name: agent-api
+    ports:
+      - "8003:8003"
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      RETRIEVAL_API_URL: http://retrieval-api:8001
+      FEATURE_API_URL: http://feature-api:8002
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      temporal:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 5: Audit API ───────────────────────────────────────────────────────
+  audit-api:
+    build:
+      context: ..
+      dockerfile: src/audit_api/Dockerfile
+    container_name: audit-api
+    ports:
+      - "8004:8004"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+  # ─── Phase 5: UI ──────────────────────────────────────────────────────────────
+  ui:
+    build:
+      context: ..
+      dockerfile: src/ui/Dockerfile
+    container_name: ui
+    ports:
+      - "8501:8501"
+    environment:
+      AGENT_API_URL: http://agent-api:8003
+      AUDIT_API_URL: http://audit-api:8004
+    depends_on:
+      agent-api:
+        condition: service_healthy
+      audit-api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - biomedical
+
+# ─── Networks ──────────────────────────────────────────────────────────────────
+
+networks:
+  biomedical:
+    name: biomedical
+    driver: bridge
+
+# ─── Volumes ───────────────────────────────────────────────────────────────────
+
+volumes:
+  minio-data:
+  postgres-data:
+  redis-data:
+  qdrant-data:
+  clickhouse-data:
+  prometheus-data:
+  grafana-data:

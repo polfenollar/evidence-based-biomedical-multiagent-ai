@@ -1,0 +1,11 @@
+project: biomedical
+registry:
+  registry_type: sql
+  path: postgresql+psycopg2://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/feast_registry
+provider: local
+online_store:
+  type: redis
+  connection_string: "{REDIS_HOST}:{REDIS_PORT},password={REDIS_PASSWORD}"
+offline_store:
+  type: file
+entity_key_serialization_version: 2
