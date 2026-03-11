@@ -1,6 +1,8 @@
 ## Evidence-Based Bio-Medical Multi-Agent System (Open Source)
 
-This is an MLOps production-grade, self-hosted biomedical evidence synthesis platform using a governed lakehouse and a deterministic multi-agent workflow.
+This is an MLOps, production-grade, self-hosted biomedical evidence synthesis platform using a governed lakehouse and a deterministic multi-agent workflow.
+
+It´s intended to ease medical research for trials and articles by providing a contextual search engine with transparent and auditable results (both content and agents traceability)
 
 ### Key properties
 
@@ -11,6 +13,7 @@ This is an MLOps production-grade, self-hosted biomedical evidence synthesis pla
 - **AI features**: Feast feature store for ground-truth statistics.
 - **Two-layer orchestration**: LangGraph (cognitive state machine) + Temporal (durable workflows).
 - **Fully auditable and transparent agents** (traceability, provenance, replay/reconstruction).
+- **Fully observable with Prometheus, Loki, Grafana and Langsmith for agent monitoring and tracing
 
 ---
 
