@@ -1,6 +1,6 @@
 ## Evidence-Based Bio-Medical Multi-Agent System (Open Source)
 
-Production-grade, self-hosted biomedical evidence synthesis platform using a governed lakehouse and a deterministic multi-agent workflow.
+This is an MLOps production-grade, self-hosted biomedical evidence synthesis platform using a governed lakehouse and a deterministic multi-agent workflow.
 
 ### Key properties
 
@@ -10,7 +10,7 @@ Production-grade, self-hosted biomedical evidence synthesis platform using a gov
 - **AI context**: Vector DB (Qdrant or Milvus) + embedding pipeline.
 - **AI features**: Feast feature store for ground-truth statistics.
 - **Two-layer orchestration**: LangGraph (cognitive state machine) + Temporal (durable workflows).
-- **Non-negotiable**: **Fully auditable and transparent agents** (traceability, provenance, replay/reconstruction).
+- **Fully auditable and transparent agents** (traceability, provenance, replay/reconstruction).
 
 ---
 
@@ -49,11 +49,4 @@ This repository currently contains the project documentation and delivery-qualit
 
 ---
 
-## Human actions requested (optional, for faster implementation)
-
-To accelerate design review with real-world reference code, clone these upstream OSS repos locally and share any notes/questions:
-
-- Temporal Python samples: `https://github.com/temporalio/samples-python`
-- LangGraph repo/examples: `https://github.com/langchain-ai/langgraph`
-- (Optional) Langfuse self-host patterns: `https://github.com/langfuse/langfuse`
 
